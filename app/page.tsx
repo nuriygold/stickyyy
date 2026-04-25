@@ -1,8 +1,9 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Bookmark, Sparkles } from "lucide-react"
 import { toast } from "sonner"
+import { useObject } from "@ai-sdk/react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import { AgentTrace } from "@/components/sticker-concierge/agent-trace"
@@ -15,17 +16,22 @@ import { VaultSheet } from "@/components/sticker-concierge/vault-sheet"
 import {
   INITIAL_TOOLS,
   INITIAL_TRACE,
-  refineSearch,
-  searchIconicMoments,
+  isRenderableReaction,
+  mapReactionsToResults,
 } from "@/lib/sticker-concierge/agent"
+import { agentResponseSchema } from "@/lib/sticker-concierge/schema"
 import type {
   AgentTool,
   ReactionResult,
   SavedReaction,
+  ToolStatus,
+  TraceStatus,
   TraceStep,
 } from "@/lib/sticker-concierge/types"
 
 type RunPhase = "idle" | "running" | "results"
+
+const TRACE_STEP_INTERVAL = 480
 
 export default function Page() {
   const [query, setQuery] = useState("")
@@ -39,100 +45,171 @@ export default function Page() {
 
   const savedIds = useMemo(() => new Set(saved.map((s) => s.id)), [saved])
 
-  // ---------- Agent runtime (mocked) ----------
-  // In production this would stream from a server action wrapping the real
-  // agent runtime (analyzeVibe -> searchIconicMoments -> rankResults -> ...).
+  // ---------- AI SDK streaming via Vercel AI Gateway ----------
+  const { object, submit, isLoading, error, stop } = useObject({
+    api: "/api/agent",
+    schema: agentResponseSchema,
+  })
+
+  const runIdRef = useRef<string>("")
+  const traceTimersRef = useRef<ReturnType<typeof setTimeout>[]>([])
+
+  const clearTraceTimers = useCallback(() => {
+    traceTimersRef.current.forEach((t) => clearTimeout(t))
+    traceTimersRef.current = []
+  }, [])
+
+  // Trace step setters
+  const setStepStatus = useCallback((id: string, status: TraceStatus) => {
+    setTrace((prev) => prev.map((s) => (s.id === id ? { ...s, status } : s)))
+  }, [])
+  const setToolStatus = useCallback((id: string, status: ToolStatus) => {
+    setTools((prev) => prev.map((t) => (t.id === id ? { ...t, status } : t)))
+  }, [])
+
+  // ---------- Run agent (streaming) ----------
   const runAgent = useCallback(
-    async (q: string, opts?: { fromRefinement?: boolean; sourceResults?: ReactionResult[] }) => {
+    (q: string, opts?: { fromRefinement?: boolean }) => {
+      clearTraceTimers()
+      const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+      runIdRef.current = runId
+
       setPhase("running")
       setSubmittedQuery(q)
+      setTrace(INITIAL_TRACE.map((s) => ({ ...s, status: "pending" })))
+      setTools(INITIAL_TOOLS.map((t) => ({ ...t, status: "queued" })))
 
-      // reset trace + tools
-      const freshTrace: TraceStep[] = INITIAL_TRACE.map((s) => ({ ...s, status: "pending" }))
-      const freshTools: AgentTool[] = INITIAL_TOOLS.map((t) => ({ ...t, status: "queued" }))
-      setTrace(freshTrace)
-      setTools(freshTools)
-      if (!opts?.fromRefinement) setResults([])
+      // Keep prior results dimmed if this is a refinement; otherwise clear.
+      const refineFrom = opts?.fromRefinement
+        ? results.map((r) => ({
+            vibeLabel: r.vibeLabel,
+            culturalContext: r.culturalContext,
+            matchScore: r.matchScore,
+          }))
+        : null
 
-      // step through trace with timing
-      const stepDelay = 380
-      for (let i = 0; i < freshTrace.length; i++) {
-        await wait(stepDelay)
-        setTrace((prev) =>
-          prev.map((s, idx) =>
-            idx === i ? { ...s, status: "running" } : idx < i ? { ...s, status: "complete" } : s,
-          ),
-        )
-
-        // tool transitions tied loosely to trace progress
-        if (i === 1) {
-          setTools((prev) =>
-            prev.map((t) => (t.id === "meme-search" ? { ...t, status: "running" } : t)),
-          )
-        }
-        if (i === 2) {
-          setTools((prev) =>
-            prev.map((t) =>
-              t.id === "meme-search"
-                ? { ...t, status: "complete" }
-                : t.id === "web-image"
-                  ? { ...t, status: "running" }
-                  : t.id === "vault-memory"
-                    ? { ...t, status: "running" }
-                    : t,
-            ),
-          )
-        }
-        if (i === 3) {
-          setTools((prev) =>
-            prev.map((t) =>
-              t.id === "web-image" || t.id === "vault-memory"
-                ? { ...t, status: "complete" }
-                : t.id === "vibe-ranking"
-                  ? { ...t, status: "running" }
-                  : t,
-            ),
-          )
-        }
-        if (i === 4) {
-          setTools((prev) =>
-            prev.map((t) =>
-              t.id === "vibe-ranking"
-                ? { ...t, status: "complete" }
-                : t.id === "caption-helper"
-                  ? { ...t, status: "running" }
-                  : t,
-            ),
-          )
-        }
+      if (!opts?.fromRefinement) {
+        setResults([])
       }
 
-      // mark final step complete
-      setTrace((prev) => prev.map((s) => ({ ...s, status: "complete" })))
-      setTools((prev) => prev.map((t) => ({ ...t, status: "complete" })))
+      // Cinematic trace walk-through. The final two steps wait for the stream to complete.
+      const t1 = setTimeout(() => {
+        setStepStatus("vibe", "running")
+      }, 60)
+      const t2 = setTimeout(() => {
+        setStepStatus("vibe", "complete")
+        setStepStatus("refs", "running")
+        setToolStatus("meme-search", "running")
+      }, TRACE_STEP_INTERVAL)
+      const t3 = setTimeout(() => {
+        setStepStatus("refs", "complete")
+        setStepStatus("search", "running")
+        setToolStatus("meme-search", "complete")
+        setToolStatus("web-image", "running")
+        setToolStatus("vault-memory", "running")
+      }, TRACE_STEP_INTERVAL * 2)
+      traceTimersRef.current = [t1, t2, t3]
 
-      // produce results
-      const next = opts?.fromRefinement && opts.sourceResults
-        ? refineSearch(opts.sourceResults, q)
-        : searchIconicMoments(q)
-      setResults(next)
-      setPhase("results")
+      // Kick off the actual streaming generation.
+      submit({ query: q, refineFrom })
     },
-    [],
+    [clearTraceTimers, results, setStepStatus, setToolStatus, submit],
   )
 
+  // ---------- React to stream lifecycle ----------
+  // When first reaction starts arriving, advance trace into "verify".
+  const partialReactions = object?.reactions
+  const partialCount = Array.isArray(partialReactions) ? partialReactions.length : 0
+
+  useEffect(() => {
+    if (!isLoading) return
+    if (partialCount === 0) return
+    setStepStatus("search", "complete")
+    setStepStatus("verify", "running")
+    setToolStatus("web-image", "complete")
+    setToolStatus("vault-memory", "complete")
+  }, [isLoading, partialCount, setStepStatus, setToolStatus])
+
+  // Live mirror partial results into the cards while streaming.
+  useEffect(() => {
+    if (!isLoading) return
+    if (!partialReactions) return
+    const ready = partialReactions.filter(isRenderableReaction)
+    if (ready.length === 0) return
+    setResults(mapReactionsToResults(ready, runIdRef.current))
+  }, [isLoading, partialReactions])
+
+  // When the stream finishes successfully, complete trace + final sort.
+  useEffect(() => {
+    if (isLoading) return
+    if (!object?.reactions) return
+
+    clearTraceTimers()
+    const finalize = setTimeout(() => {
+      setStepStatus("verify", "complete")
+      setStepStatus("rank", "running")
+      setToolStatus("vibe-ranking", "running")
+
+      const r2 = setTimeout(() => {
+        setStepStatus("rank", "complete")
+        setStepStatus("ready", "running")
+        setToolStatus("vibe-ranking", "complete")
+        setToolStatus("caption-helper", "running")
+
+        const r3 = setTimeout(() => {
+          setStepStatus("ready", "complete")
+          setToolStatus("caption-helper", "complete")
+        }, 280)
+        traceTimersRef.current.push(r3)
+      }, 320)
+      traceTimersRef.current.push(r2)
+    }, 120)
+    traceTimersRef.current.push(finalize)
+
+    // Final sort by matchScore desc.
+    const ready = object.reactions.filter(isRenderableReaction)
+    const sorted = [...ready].sort((a, b) => b.matchScore - a.matchScore)
+    setResults(mapReactionsToResults(sorted, runIdRef.current))
+    setPhase("results")
+
+    return () => clearTraceTimers()
+  }, [isLoading, object, clearTraceTimers, setStepStatus, setToolStatus])
+
+  // Handle errors from the AI Gateway.
+  useEffect(() => {
+    if (!error) return
+    clearTraceTimers()
+    setPhase((prev) => (results.length > 0 ? "results" : "idle"))
+    toast("Generation failed", {
+      description:
+        error instanceof Error
+          ? error.message
+          : "The agent could not complete this run. Try again.",
+    })
+  }, [error, clearTraceTimers, results.length])
+
+  // Cleanup on unmount.
+  useEffect(() => {
+    return () => {
+      clearTraceTimers()
+      stop()
+    }
+  }, [clearTraceTimers, stop])
+
+  // ---------- Submit handlers ----------
   const handleSubmit = useCallback(() => {
     const q = query.trim()
-    if (!q) return
+    if (!q || isLoading) return
     setRecentSearches((prev) => {
       const without = prev.filter((p) => p !== q)
       return [q, ...without].slice(0, 8)
     })
     runAgent(q)
-  }, [query, runAgent])
+  }, [query, isLoading, runAgent])
 
   const handleSelectChip = useCallback(
     (chip: string) => {
+      if (isLoading) return
       setQuery(chip)
       setRecentSearches((prev) => {
         const without = prev.filter((p) => p !== chip)
@@ -140,7 +217,7 @@ export default function Page() {
       })
       runAgent(chip)
     },
-    [runAgent],
+    [isLoading, runAgent],
   )
 
   // ---------- Vault actions ----------
@@ -160,7 +237,7 @@ export default function Page() {
   }, [])
 
   const handleCopy = useCallback((r: ReactionResult) => {
-    const text = `${r.vibeLabel} — ${r.culturalContext} (${r.sourceUrl})`
+    const text = `${r.vibeLabel} — ${r.culturalContext}`
     if (typeof navigator !== "undefined" && navigator.clipboard) {
       navigator.clipboard.writeText(text).catch(() => {})
     }
@@ -168,37 +245,40 @@ export default function Page() {
   }, [])
 
   const handleOpenSource = useCallback((r: ReactionResult) => {
-    toast("Opening source (mock)", { description: r.sourceLabel })
+    if (typeof window !== "undefined") {
+      window.open(r.sourceUrl, "_blank", "noopener,noreferrer")
+    }
   }, [])
 
   const handleRefine = useCallback(
     (r: ReactionResult, refinement: string) => {
-      // Re-run the agent with the refinement appended for visual feedback,
-      // but reuse the existing result set as the source so ranking shifts.
+      if (isLoading) return
       const q = `${submittedQuery || r.vibeLabel} — ${refinement}`
-      runAgent(q, { fromRefinement: true, sourceResults: results })
+      runAgent(q, { fromRefinement: true })
     },
-    [results, submittedQuery, runAgent],
+    [submittedQuery, runAgent, isLoading],
   )
 
   const handleSelectSearchFromVault = useCallback(
     (q: string) => {
+      if (isLoading) return
       setQuery(q)
       runAgent(q)
     },
-    [runAgent],
+    [isLoading, runAgent],
   )
 
   const handleSelectTagFromVault = useCallback(
     (tag: string) => {
+      if (isLoading) return
       const q = `Reaction with vibe: ${tag}`
       setQuery(q)
       runAgent(q)
     },
-    [runAgent],
+    [isLoading, runAgent],
   )
 
-  // Subtle scroll to top of results when a new run completes
+  // Subtle scroll to top when a new run begins.
   useEffect(() => {
     if (phase === "running") {
       window.scrollTo({ top: 0, behavior: "smooth" })
@@ -264,7 +344,7 @@ export default function Page() {
           </section>
         )}
 
-        {/* Agent trace + tools (only while running or after results) */}
+        {/* Agent trace + tools (while running or after results) */}
         {phase !== "idle" && (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 mb-6">
             <AgentTrace steps={trace} query={submittedQuery} />
@@ -284,7 +364,7 @@ export default function Page() {
             aria-label="Results"
             className={cn(
               "mt-2 fade-up transition-opacity",
-              phase === "running" && "opacity-60",
+              isLoading && "opacity-70",
             )}
           >
             <div className="flex items-baseline justify-between mb-4">
@@ -292,7 +372,7 @@ export default function Page() {
                 {results.length} ranked moments
               </h2>
               <p className="text-xs text-muted-foreground">
-                {phase === "running" ? "Re-ranking…" : "Sorted by reaction strength"}
+                {isLoading ? "Streaming…" : "Sorted by reaction strength"}
               </p>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
@@ -331,12 +411,8 @@ export default function Page() {
         value={query}
         onChange={setQuery}
         onSubmit={handleSubmit}
-        isRunning={phase === "running"}
+        isRunning={isLoading}
       />
     </main>
   )
-}
-
-function wait(ms: number) {
-  return new Promise((res) => setTimeout(res, ms))
 }
