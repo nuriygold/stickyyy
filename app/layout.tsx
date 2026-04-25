@@ -1,22 +1,7 @@
 import type React from "react"
 import type { Metadata, Viewport } from "next"
-import { Inter, Instrument_Serif } from "next/font/google"
 import { Toaster } from "@/components/ui/sonner"
 import "./globals.css"
-
-const inter = Inter({
-  subsets: ["latin"],
-  variable: "--font-sans",
-  display: "swap",
-})
-
-const instrumentSerif = Instrument_Serif({
-  subsets: ["latin"],
-  weight: "400",
-  style: ["normal", "italic"],
-  variable: "--font-serif",
-  display: "swap",
-})
 
 export const metadata: Metadata = {
   title: "Sticker Concierge — Find the exact reaction for the moment",
@@ -39,7 +24,7 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className={`${inter.variable} ${instrumentSerif.variable} bg-background`}>
+    <html lang="en" className="bg-background">
       <body className="font-sans antialiased grain min-h-screen bg-background text-foreground">
         {children}
         <Toaster position="top-center" />
