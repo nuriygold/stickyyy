@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Bookmark, LogOut, Sparkles, User } from "lucide-react"
 import { toast } from "sonner"
-import { useObject } from "@ai-sdk/react"
 import useSWR, { mutate } from "swr"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
@@ -45,6 +44,8 @@ export default function Page() {
   const [trace, setTrace] = useState<TraceStep[]>(INITIAL_TRACE)
   const [tools, setTools] = useState<AgentTool[]>(INITIAL_TOOLS)
   const [results, setResults] = useState<ReactionResult[]>([])
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<Error | null>(null)
 
   // --- Auth state ---
   const [userId, setUserId] = useState<string | null>(null)
@@ -80,14 +81,9 @@ export default function Page() {
   )
   const recentSearches: string[] = searchesData?.searches ?? []
 
-  // ---------- AI SDK streaming via Vercel AI Gateway ----------
-  const { object, submit, isLoading, error, stop } = useObject({
-    api: "/api/agent",
-    schema: agentResponseSchema,
-  })
-
   const runIdRef = useRef<string>("")
   const traceTimersRef = useRef<ReturnType<typeof setTimeout>[]>([])
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   const clearTraceTimers = useCallback(() => {
     traceTimersRef.current.forEach((t) => clearTimeout(t))
@@ -102,10 +98,11 @@ export default function Page() {
     setTools((prev) => prev.map((t) => (t.id === id ? { ...t, status } : t)))
   }, [])
 
-  // ---------- Run agent (streaming) ----------
+  // ---------- Run agent (streaming JSON) ----------
   const runAgent = useCallback(
     (q: string, opts?: { fromRefinement?: boolean }) => {
       clearTraceTimers()
+      setError(null)
       const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
       runIdRef.current = runId
 
@@ -141,7 +138,113 @@ export default function Page() {
       }, TRACE_STEP_INTERVAL * 2)
       traceTimersRef.current = [t1, t2, t3]
 
-      submit({ query: q, refineFrom })
+      setIsLoading(true)
+
+      // Abort previous request if any
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+      }
+      abortControllerRef.current = new AbortController()
+
+      ;(async () => {
+        try {
+          const response = await fetch("/api/agent", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: q, refineFrom }),
+            signal: abortControllerRef.current?.signal,
+          })
+
+          if (!response.ok) throw new Error(`API error: ${response.status}`)
+          if (!response.body) throw new Error("No response body")
+
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ""
+          let partialObj: any = {}
+
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+
+            buffer += decoder.decode(value, { stream: true })
+
+            // Parse SSE lines
+            const lines = buffer.split("\n")
+            buffer = lines.pop() || ""
+
+            for (const line of lines) {
+              if (!line.trim().startsWith("data:")) continue
+
+              const data = line.trim().slice(5).trim()
+              if (data === "[DONE]") continue
+
+              try {
+                partialObj = JSON.parse(data)
+
+                // Update results as they stream in
+                if (partialObj.reactions && Array.isArray(partialObj.reactions)) {
+                  const ready = partialObj.reactions.filter(isRenderableReaction)
+                  if (ready.length > 0) {
+                    if (results.length === 0) {
+                      setStepStatus("search", "complete")
+                      setStepStatus("verify", "running")
+                      setToolStatus("web-image", "complete")
+                      setToolStatus("vault-memory", "complete")
+                    }
+                    setResults(mapReactionsToResults(ready, runId))
+                  }
+                }
+              } catch {
+                // Skip malformed JSON
+              }
+            }
+          }
+
+          // Final update with all reactions sorted
+          if (partialObj.reactions && Array.isArray(partialObj.reactions)) {
+            const ready = partialObj.reactions.filter(isRenderableReaction)
+            const sorted = [...ready].sort((a, b) => b.matchScore - a.matchScore)
+            setResults(mapReactionsToResults(sorted, runId))
+          }
+
+          // Finalize trace
+          clearTraceTimers()
+          const finalize = setTimeout(() => {
+            setStepStatus("verify", "complete")
+            setStepStatus("rank", "running")
+            setToolStatus("vibe-ranking", "running")
+
+            const r2 = setTimeout(() => {
+              setStepStatus("rank", "complete")
+              setStepStatus("ready", "running")
+              setToolStatus("vibe-ranking", "complete")
+              setToolStatus("caption-helper", "running")
+
+              const r3 = setTimeout(() => {
+                setStepStatus("ready", "complete")
+                setToolStatus("caption-helper", "complete")
+              }, 280)
+              traceTimersRef.current.push(r3)
+            }, 320)
+            traceTimersRef.current.push(r2)
+          }, 120)
+          traceTimersRef.current.push(finalize)
+
+          setPhase("results")
+          setIsLoading(false)
+        } catch (err) {
+          if (err instanceof Error && err.name === "AbortError") return
+
+          clearTraceTimers()
+          setPhase((prev) => (results.length > 0 ? "results" : "idle"))
+          const errMsg =
+            err instanceof Error ? err.message : "The agent could not complete this run. Try again."
+          setError(err instanceof Error ? err : new Error(errMsg))
+          toast("Generation failed", { description: errMsg })
+          setIsLoading(false)
+        }
+      })()
 
       // Persist search in background (no-op when logged out)
       if (isLoggedIn) {
@@ -152,82 +255,8 @@ export default function Page() {
         }).then(() => mutate("/api/searches"))
       }
     },
-    [clearTraceTimers, results, setStepStatus, setToolStatus, submit, isLoggedIn],
+    [clearTraceTimers, results, setStepStatus, setToolStatus, isLoggedIn],
   )
-
-  // React to stream lifecycle
-  const partialReactions = object?.reactions
-  const partialCount = Array.isArray(partialReactions) ? partialReactions.length : 0
-
-  useEffect(() => {
-    if (!isLoading) return
-    if (partialCount === 0) return
-    setStepStatus("search", "complete")
-    setStepStatus("verify", "running")
-    setToolStatus("web-image", "complete")
-    setToolStatus("vault-memory", "complete")
-  }, [isLoading, partialCount, setStepStatus, setToolStatus])
-
-  useEffect(() => {
-    if (!isLoading) return
-    if (!partialReactions) return
-    const ready = partialReactions.filter(isRenderableReaction)
-    if (ready.length === 0) return
-    setResults(mapReactionsToResults(ready, runIdRef.current))
-  }, [isLoading, partialReactions])
-
-  useEffect(() => {
-    if (isLoading) return
-    if (!object?.reactions) return
-
-    clearTraceTimers()
-    const finalize = setTimeout(() => {
-      setStepStatus("verify", "complete")
-      setStepStatus("rank", "running")
-      setToolStatus("vibe-ranking", "running")
-
-      const r2 = setTimeout(() => {
-        setStepStatus("rank", "complete")
-        setStepStatus("ready", "running")
-        setToolStatus("vibe-ranking", "complete")
-        setToolStatus("caption-helper", "running")
-
-        const r3 = setTimeout(() => {
-          setStepStatus("ready", "complete")
-          setToolStatus("caption-helper", "complete")
-        }, 280)
-        traceTimersRef.current.push(r3)
-      }, 320)
-      traceTimersRef.current.push(r2)
-    }, 120)
-    traceTimersRef.current.push(finalize)
-
-    const ready = object.reactions.filter(isRenderableReaction)
-    const sorted = [...ready].sort((a, b) => b.matchScore - a.matchScore)
-    setResults(mapReactionsToResults(sorted, runIdRef.current))
-    setPhase("results")
-
-    return () => clearTraceTimers()
-  }, [isLoading, object, clearTraceTimers, setStepStatus, setToolStatus])
-
-  useEffect(() => {
-    if (!error) return
-    clearTraceTimers()
-    setPhase((prev) => (results.length > 0 ? "results" : "idle"))
-    toast("Generation failed", {
-      description:
-        error instanceof Error
-          ? error.message
-          : "The agent could not complete this run. Try again.",
-    })
-  }, [error, clearTraceTimers, results.length])
-
-  useEffect(() => {
-    return () => {
-      clearTraceTimers()
-      stop()
-    }
-  }, [clearTraceTimers, stop])
 
   // ---------- Submit handlers ----------
   const handleSubmit = useCallback(() => {
@@ -343,6 +372,15 @@ export default function Page() {
       window.scrollTo({ top: 0, behavior: "smooth" })
     }
   }, [phase])
+
+  useEffect(() => {
+    return () => {
+      clearTraceTimers()
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+      }
+    }
+  }, [clearTraceTimers])
 
   return (
     <main className="min-h-screen pb-48">
