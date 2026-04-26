@@ -1,10 +1,10 @@
 import { streamText, Output } from "ai"
-import { createAzureOpenAI } from "@ai-sdk/azure"
+import { createAzure } from "@ai-sdk/azure"
 import { agentResponseSchema } from "@/lib/sticker-concierge/schema"
 
 export const maxDuration = 30
 
-const azure = createAzureOpenAI({
+const azure = createAzure({
   apiKey: process.env.AZURE_OPENAI_API_KEY,
   baseURL: process.env.AZURE_OPENAI_ENDPOINT,
   defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
