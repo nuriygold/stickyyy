@@ -1,9 +1,10 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Bookmark, Sparkles } from "lucide-react"
+import { Bookmark, LogOut, Sparkles, User } from "lucide-react"
 import { toast } from "sonner"
 import { useObject } from "@ai-sdk/react"
+import useSWR, { mutate } from "swr"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import { AgentTrace } from "@/components/sticker-concierge/agent-trace"
@@ -20,6 +21,7 @@ import {
   mapReactionsToResults,
 } from "@/lib/sticker-concierge/agent"
 import { agentResponseSchema } from "@/lib/sticker-concierge/schema"
+import { createClient } from "@/lib/supabase/client"
 import type {
   AgentTool,
   ReactionResult,
@@ -33,6 +35,9 @@ type RunPhase = "idle" | "running" | "results"
 
 const TRACE_STEP_INTERVAL = 480
 
+// SWR fetcher
+const fetcher = (url: string) => fetch(url).then((r) => r.json())
+
 export default function Page() {
   const [query, setQuery] = useState("")
   const [submittedQuery, setSubmittedQuery] = useState<string>("")
@@ -40,10 +45,40 @@ export default function Page() {
   const [trace, setTrace] = useState<TraceStep[]>(INITIAL_TRACE)
   const [tools, setTools] = useState<AgentTool[]>(INITIAL_TOOLS)
   const [results, setResults] = useState<ReactionResult[]>([])
-  const [saved, setSaved] = useState<SavedReaction[]>([])
-  const [recentSearches, setRecentSearches] = useState<string[]>([])
 
+  // --- Auth state ---
+  const [userId, setUserId] = useState<string | null>(null)
+  const [userEmail, setUserEmail] = useState<string | null>(null)
+
+  useEffect(() => {
+    const supabase = createClient()
+    supabase.auth.getUser().then(({ data }) => {
+      setUserId(data.user?.id ?? null)
+      setUserEmail(data.user?.email ?? null)
+    })
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUserId(session?.user?.id ?? null)
+      setUserEmail(session?.user?.email ?? null)
+    })
+    return () => listener.subscription.unsubscribe()
+  }, [])
+
+  const isLoggedIn = Boolean(userId)
+
+  // --- Vault (persisted via API) ---
+  const { data: vaultData } = useSWR<{ saved: SavedReaction[] }>(
+    isLoggedIn ? "/api/vault" : null,
+    fetcher,
+  )
+  const saved: SavedReaction[] = vaultData?.saved ?? []
   const savedIds = useMemo(() => new Set(saved.map((s) => s.id)), [saved])
+
+  // --- Recent searches (persisted via API) ---
+  const { data: searchesData } = useSWR<{ searches: string[] }>(
+    isLoggedIn ? "/api/searches" : null,
+    fetcher,
+  )
+  const recentSearches: string[] = searchesData?.searches ?? []
 
   // ---------- AI SDK streaming via Vercel AI Gateway ----------
   const { object, submit, isLoading, error, stop } = useObject({
@@ -59,10 +94,10 @@ export default function Page() {
     traceTimersRef.current = []
   }, [])
 
-  // Trace step setters
   const setStepStatus = useCallback((id: string, status: TraceStatus) => {
     setTrace((prev) => prev.map((s) => (s.id === id ? { ...s, status } : s)))
   }, [])
+
   const setToolStatus = useCallback((id: string, status: ToolStatus) => {
     setTools((prev) => prev.map((t) => (t.id === id ? { ...t, status } : t)))
   }, [])
@@ -79,7 +114,6 @@ export default function Page() {
       setTrace(INITIAL_TRACE.map((s) => ({ ...s, status: "pending" })))
       setTools(INITIAL_TOOLS.map((t) => ({ ...t, status: "queued" })))
 
-      // Keep prior results dimmed if this is a refinement; otherwise clear.
       const refineFrom = opts?.fromRefinement
         ? results.map((r) => ({
             vibeLabel: r.vibeLabel,
@@ -92,10 +126,7 @@ export default function Page() {
         setResults([])
       }
 
-      // Cinematic trace walk-through. The final two steps wait for the stream to complete.
-      const t1 = setTimeout(() => {
-        setStepStatus("vibe", "running")
-      }, 60)
+      const t1 = setTimeout(() => setStepStatus("vibe", "running"), 60)
       const t2 = setTimeout(() => {
         setStepStatus("vibe", "complete")
         setStepStatus("refs", "running")
@@ -110,14 +141,21 @@ export default function Page() {
       }, TRACE_STEP_INTERVAL * 2)
       traceTimersRef.current = [t1, t2, t3]
 
-      // Kick off the actual streaming generation.
       submit({ query: q, refineFrom })
+
+      // Persist search in background (no-op when logged out)
+      if (isLoggedIn) {
+        fetch("/api/searches", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: q }),
+        }).then(() => mutate("/api/searches"))
+      }
     },
-    [clearTraceTimers, results, setStepStatus, setToolStatus, submit],
+    [clearTraceTimers, results, setStepStatus, setToolStatus, submit, isLoggedIn],
   )
 
-  // ---------- React to stream lifecycle ----------
-  // When first reaction starts arriving, advance trace into "verify".
+  // React to stream lifecycle
   const partialReactions = object?.reactions
   const partialCount = Array.isArray(partialReactions) ? partialReactions.length : 0
 
@@ -130,7 +168,6 @@ export default function Page() {
     setToolStatus("vault-memory", "complete")
   }, [isLoading, partialCount, setStepStatus, setToolStatus])
 
-  // Live mirror partial results into the cards while streaming.
   useEffect(() => {
     if (!isLoading) return
     if (!partialReactions) return
@@ -139,7 +176,6 @@ export default function Page() {
     setResults(mapReactionsToResults(ready, runIdRef.current))
   }, [isLoading, partialReactions])
 
-  // When the stream finishes successfully, complete trace + final sort.
   useEffect(() => {
     if (isLoading) return
     if (!object?.reactions) return
@@ -166,7 +202,6 @@ export default function Page() {
     }, 120)
     traceTimersRef.current.push(finalize)
 
-    // Final sort by matchScore desc.
     const ready = object.reactions.filter(isRenderableReaction)
     const sorted = [...ready].sort((a, b) => b.matchScore - a.matchScore)
     setResults(mapReactionsToResults(sorted, runIdRef.current))
@@ -175,7 +210,6 @@ export default function Page() {
     return () => clearTraceTimers()
   }, [isLoading, object, clearTraceTimers, setStepStatus, setToolStatus])
 
-  // Handle errors from the AI Gateway.
   useEffect(() => {
     if (!error) return
     clearTraceTimers()
@@ -188,7 +222,6 @@ export default function Page() {
     })
   }, [error, clearTraceTimers, results.length])
 
-  // Cleanup on unmount.
   useEffect(() => {
     return () => {
       clearTraceTimers()
@@ -200,10 +233,6 @@ export default function Page() {
   const handleSubmit = useCallback(() => {
     const q = query.trim()
     if (!q || isLoading) return
-    setRecentSearches((prev) => {
-      const without = prev.filter((p) => p !== q)
-      return [q, ...without].slice(0, 8)
-    })
     runAgent(q)
   }, [query, isLoading, runAgent])
 
@@ -211,30 +240,55 @@ export default function Page() {
     (chip: string) => {
       if (isLoading) return
       setQuery(chip)
-      setRecentSearches((prev) => {
-        const without = prev.filter((p) => p !== chip)
-        return [chip, ...without].slice(0, 8)
-      })
       runAgent(chip)
     },
     [isLoading, runAgent],
   )
 
   // ---------- Vault actions ----------
-  const handleSave = useCallback((r: ReactionResult) => {
-    setSaved((prev) => {
-      if (prev.some((s) => s.id === r.id)) {
-        toast("Removed from vault", { description: r.vibeLabel })
-        return prev.filter((s) => s.id !== r.id)
+  const handleSave = useCallback(
+    async (r: ReactionResult) => {
+      if (!isLoggedIn) {
+        toast("Sign in to save reactions", { description: "Create a free account to use your vault." })
+        return
       }
-      toast("Saved to vault", { description: r.vibeLabel })
-      return [{ ...r, savedAt: Date.now() }, ...prev]
-    })
-  }, [])
 
-  const handleRemoveSaved = useCallback((id: string) => {
-    setSaved((prev) => prev.filter((s) => s.id !== id))
-  }, [])
+      const alreadySaved = savedIds.has(r.id)
+
+      // Optimistic update
+      mutate(
+        "/api/vault",
+        alreadySaved
+          ? { saved: saved.filter((s) => s.id !== r.id) }
+          : { saved: [{ ...r, savedAt: Date.now() }, ...saved] },
+        false,
+      )
+
+      if (alreadySaved) {
+        toast("Removed from vault", { description: r.vibeLabel })
+        await fetch(`/api/vault?id=${encodeURIComponent(r.id)}`, { method: "DELETE" })
+      } else {
+        toast("Saved to vault", { description: r.vibeLabel })
+        await fetch("/api/vault", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(r),
+        })
+      }
+
+      mutate("/api/vault")
+    },
+    [isLoggedIn, savedIds, saved],
+  )
+
+  const handleRemoveSaved = useCallback(
+    async (id: string) => {
+      mutate("/api/vault", { saved: saved.filter((s) => s.id !== id) }, false)
+      await fetch(`/api/vault?id=${encodeURIComponent(id)}`, { method: "DELETE" })
+      mutate("/api/vault")
+    },
+    [saved],
+  )
 
   const handleCopy = useCallback((r: ReactionResult) => {
     const text = `${r.vibeLabel} — ${r.culturalContext}`
@@ -278,7 +332,12 @@ export default function Page() {
     [isLoading, runAgent],
   )
 
-  // Subtle scroll to top when a new run begins.
+  const handleSignOut = useCallback(async () => {
+    const supabase = createClient()
+    await supabase.auth.signOut()
+    toast("Signed out")
+  }, [])
+
   useEffect(() => {
     if (phase === "running") {
       window.scrollTo({ top: 0, behavior: "smooth" })
@@ -296,28 +355,49 @@ export default function Page() {
             </div>
             <span className="text-sm font-medium tracking-tight">Sticker Concierge</span>
           </div>
-          <VaultSheet
-            saved={saved}
-            recentSearches={recentSearches}
-            onRemove={handleRemoveSaved}
-            onSelectSearch={handleSelectSearchFromVault}
-            onSelectTag={handleSelectTagFromVault}
-            trigger={
+
+          <div className="flex items-center gap-1.5">
+            {isLoggedIn && (
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-8 px-2.5 text-xs text-foreground/85 hover:text-foreground"
+                className="h-8 px-2.5 text-xs text-foreground/60 hover:text-foreground"
+                onClick={handleSignOut}
+                aria-label="Sign out"
               >
-                <Bookmark className="h-3.5 w-3.5 mr-1.5" />
-                Vault
-                {saved.length > 0 && (
-                  <span className="ml-1.5 inline-flex items-center justify-center min-w-5 h-5 px-1.5 rounded-full bg-primary/15 text-primary text-[10px] font-medium">
-                    {saved.length}
-                  </span>
-                )}
+                <LogOut className="h-3.5 w-3.5 mr-1" />
+                <span className="hidden sm:inline">{userEmail?.split("@")[0]}</span>
+                <LogOut className="h-3.5 w-3.5 sm:hidden" />
               </Button>
-            }
-          />
+            )}
+
+            <VaultSheet
+              saved={saved}
+              recentSearches={recentSearches}
+              isLoggedIn={isLoggedIn}
+              onRemove={handleRemoveSaved}
+              onSelectSearch={handleSelectSearchFromVault}
+              onSelectTag={handleSelectTagFromVault}
+              trigger={
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2.5 text-xs text-foreground/85 hover:text-foreground"
+                >
+                  <Bookmark className="h-3.5 w-3.5 mr-1.5" />
+                  Vault
+                  {isLoggedIn && saved.length > 0 && (
+                    <span className="ml-1.5 inline-flex items-center justify-center min-w-5 h-5 px-1.5 rounded-full bg-primary/15 text-primary text-[10px] font-medium">
+                      {saved.length}
+                    </span>
+                  )}
+                  {!isLoggedIn && (
+                    <User className="h-3 w-3 ml-1 text-muted-foreground" />
+                  )}
+                </Button>
+              }
+            />
+          </div>
         </div>
       </header>
 
@@ -344,7 +424,7 @@ export default function Page() {
           </section>
         )}
 
-        {/* Agent trace + tools (while running or after results) */}
+        {/* Agent trace + tools */}
         {phase !== "idle" && (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 mb-6">
             <AgentTrace steps={trace} query={submittedQuery} />
@@ -352,13 +432,14 @@ export default function Page() {
           </div>
         )}
 
-        {/* Results */}
+        {/* Results skeleton */}
         {phase === "running" && results.length === 0 && (
           <section aria-label="Loading results" className="mt-2">
             <ResultsSkeleton count={4} />
           </section>
         )}
 
+        {/* Results */}
         {results.length > 0 && (
           <section
             aria-label="Results"
