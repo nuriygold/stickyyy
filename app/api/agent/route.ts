@@ -1,7 +1,16 @@
 import { streamText, Output } from "ai"
+import { createAzureOpenAI } from "@ai-sdk/azure"
 import { agentResponseSchema } from "@/lib/sticker-concierge/schema"
 
 export const maxDuration = 30
+
+const azure = createAzureOpenAI({
+  apiKey: process.env.AZURE_OPENAI_API_KEY,
+  baseURL: process.env.AZURE_OPENAI_ENDPOINT,
+  defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
+})
+
+const azureModel = azure(process.env.AZURE_OPENAI_DEPLOYMENT_NAME || "gpt-4o")
 
 const SYSTEM_PROMPT = `You are Sticker Concierge — an agent that helps people find the *exact* reaction sticker for a moment.
 
@@ -53,7 +62,7 @@ export async function POST(req: Request) {
       : ""
 
   const result = streamText({
-    model: "openai/gpt-5-mini",
+    model: azureModel,
     system: SYSTEM_PROMPT,
     prompt: `Find 5 reaction stickers for: "${query}"${refineHint}`,
     output: Output.object({

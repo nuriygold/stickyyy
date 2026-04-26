@@ -1,109 +1,99 @@
 "use client"
 
+import { useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { useState } from "react"
 import { Sparkles } from "lucide-react"
 import { createClient } from "@/lib/supabase/client"
-import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 
-export default function Page() {
+export default function LoginPage() {
+  const router = useRouter()
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [error, setError] = useState<string | null>(null)
-  const [isLoading, setIsLoading] = useState(false)
-  const router = useRouter()
+  const [loading, setLoading] = useState(false)
 
-  const handleLogin = async (e: React.FormEvent) => {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
-    const supabase = createClient()
-    setIsLoading(true)
     setError(null)
-
-    try {
-      const { error } = await supabase.auth.signInWithPassword({ email, password })
-      if (error) throw error
+    setLoading(true)
+    const supabase = createClient()
+    const { error } = await supabase.auth.signInWithPassword({ email, password })
+    setLoading(false)
+    if (error) {
+      setError(error.message)
+    } else {
       router.push("/")
       router.refresh()
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "An error occurred")
-    } finally {
-      setIsLoading(false)
     }
   }
 
   return (
-    <main className="flex min-h-svh w-full items-center justify-center p-6 md:p-10">
+    <main className="min-h-screen flex flex-col items-center justify-center px-4">
       <div className="w-full max-w-sm">
-        <Link
-          href="/"
-          className="mb-8 inline-flex items-center gap-2 text-foreground/85 hover:text-foreground transition-colors"
-        >
+        <div className="flex items-center gap-2 mb-8">
           <div className="h-7 w-7 rounded-lg bg-primary/15 border border-primary/30 flex items-center justify-center">
             <Sparkles className="h-3.5 w-3.5 text-primary" />
           </div>
           <span className="text-sm font-medium tracking-tight">Sticker Concierge</span>
-        </Link>
+        </div>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Welcome back.</CardTitle>
-            <CardDescription>
-              Sign in to access your saved reactions and search history.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={handleLogin} className="flex flex-col gap-5">
-              <div className="grid gap-2">
-                <Label htmlFor="email">Email</Label>
-                <Input
-                  id="email"
-                  type="email"
-                  placeholder="you@example.com"
-                  required
-                  autoComplete="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="password">Password</Label>
-                <Input
-                  id="password"
-                  type="password"
-                  required
-                  autoComplete="current-password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                />
-              </div>
-              {error && (
-                <p className="text-xs text-destructive leading-relaxed">{error}</p>
-              )}
-              <Button type="submit" className="w-full" disabled={isLoading}>
-                {isLoading ? "Signing in…" : "Sign in"}
-              </Button>
-              <p className="text-xs text-center text-muted-foreground">
-                Don&apos;t have an account?{" "}
-                <Link
-                  href="/auth/sign-up"
-                  className="text-primary hover:underline underline-offset-4"
-                >
-                  Create one
-                </Link>
-              </p>
-            </form>
-          </CardContent>
-        </Card>
+        <h1 className="font-display text-3xl text-foreground mb-1">Sign in</h1>
+        <p className="text-sm text-muted-foreground mb-8">
+          Sign in to save reactions to your vault.
+        </p>
+
+        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="email" className="text-xs text-muted-foreground uppercase tracking-widest">
+              Email
+            </label>
+            <input
+              id="email"
+              type="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="w-full rounded-xl border border-border bg-secondary px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/60 transition"
+              placeholder="you@example.com"
+            />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="password" className="text-xs text-muted-foreground uppercase tracking-widest">
+              Password
+            </label>
+            <input
+              id="password"
+              type="password"
+              required
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="w-full rounded-xl border border-border bg-secondary px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/60 transition"
+              placeholder="••••••••"
+            />
+          </div>
+
+          {error && (
+            <p className="text-xs text-destructive bg-destructive/10 border border-destructive/20 rounded-lg px-3 py-2">
+              {error}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full rounded-xl bg-primary text-primary-foreground font-medium text-sm py-3 hover:bg-primary/90 transition disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {loading ? "Signing in…" : "Sign in"}
+          </button>
+        </form>
+
+        <p className="mt-6 text-center text-xs text-muted-foreground">
+          No account?{" "}
+          <Link href="/auth/sign-up" className="text-primary underline underline-offset-2 hover:text-primary/80">
+            Create one
+          </Link>
+        </p>
       </div>
     </main>
   )
