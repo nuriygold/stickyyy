@@ -16,6 +16,7 @@ type Props = {
   onRemove: (id: string) => void
   onSelectSearch: (q: string) => void
   onSelectTag: (tag: string) => void
+  isAuthed: boolean
   trigger: React.ReactNode
 }
 
@@ -25,6 +26,7 @@ export function VaultSheet({
   onRemove,
   onSelectSearch,
   onSelectTag,
+  isAuthed,
   trigger,
 }: Props) {
   return (
@@ -44,6 +46,19 @@ export function VaultSheet({
           <p className="text-xs text-muted-foreground">
             Saved reactions, recent searches, and reusable moods.
           </p>
+          {!isAuthed && (
+            <a
+              href="/auth/login"
+              className="mt-3 inline-flex items-center justify-between rounded-lg border border-primary/30 bg-primary/10 hover:bg-primary/15 transition-colors px-3 py-2"
+            >
+              <span className="text-xs text-primary leading-tight">
+                Sign in to keep your vault and history across devices.
+              </span>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-primary font-medium">
+                Sign in
+              </span>
+            </a>
+          )}
         </SheetHeader>
 
         <Tabs defaultValue="saved" className="flex-1 flex flex-col overflow-hidden">
